@@ -9,7 +9,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.tools import tool
 from langgraph.types import Command, Send
 from src.graphs.state import GraphState
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 from langgraph.graph import END, StateGraph
 from langgraph.prebuilt import ToolNode
 from pydantic import BaseModel, Field
@@ -44,13 +44,11 @@ class AgentGraph():
         
     async def get_orchestrator_node(self):
         async def orchestrator_node(state: GraphState) -> Command[Literal['tools', 'orchestrator_agent', 'investigation_agent']]:
-            state["orchestrator_agent_messages"] = add_messages(state["orchestrator_agent_messages"], [HumanMessage(f'Current round count: {state['iteration_count_overall']}')])
             resp = await self.orchestrator_agent.llm_with_tools.ainvoke(state["orchestrator_agent_messages"]) 
-            state["orchestrator_agent_messages"] = add_messages(state["orchestrator_agent_messages"], [resp])
             
             # Check if the response has tool calls (cast to AIMessage for type checking)
             
-            if state['iteration_count_overall'] >= 2:
+            if state['iteration_count_overall'] > 1 and hasattr(resp, 'tool_calls') and tool_calls[0]['name'] != 'create_jira_ticket':
                 return Send(
                     node='tools',
                     arg={
@@ -77,9 +75,9 @@ class AgentGraph():
                 elif hasattr(resp, 'tool_calls') and resp.tool_calls and len(resp.tool_calls) > 1:
                     agents_to_call = []
                     agents_message_keys = {
-                        "AnalysisInvestigationTool": ("investigation_agent", "investigation_agent_messages", 'iteration_count_investigator'),
-                        "ChangeInvestigatorTool": ("code_change_agent", "code_change_agent_messages", 'iteration_count_code_change'), 
-                        "HistoryInvestigationTool": ("historical_agent", "historical_agent_messages", 'iteration_count_historical')
+                        "AnalysisInvestigationTool": ("investigation_agent", "investigation_agent_messages", 'investigation_agent_call_id'),
+                        "ChangeInvestigatorTool": ("code_change_agent", "code_change_agent_messages", 'code_change_agent_call_id'), 
+                        "HistoryInvestigationTool": ("historical_agent", "historical_agent_messages", 'orchestrator_agent_call_id')
                     }
                     update = {
                         "orchestrator_agent_messages": [resp],
@@ -89,11 +87,10 @@ class AgentGraph():
                     for tool_call in tool_calls:
                         tool_name = tool_call['name']
                         if tool_name in agents_message_keys:
-                            agent, message_key, iteration_count_key = agents_message_keys[tool_name]
+                            agent, message_key, id_key = agents_message_keys[tool_name]
                             agents_to_call.append(agent)  
-                            
+                            update[id_key] = tool_call['id']
                             update[message_key] = [HumanMessage(content=tool_call['args']['message'], name="orchestrator_agent")]
-                            # update[iteration_count_key] = state[iteration_count_key] + 1
                     return Command(
                         goto=agents_to_call,
                         update=update
@@ -116,31 +113,30 @@ class AgentGraph():
         async def investigation_node(state: GraphState) -> Command[Literal['tools', 'orchestrator_agent', 'investigation_agent']]:
             """Investigation agent node that analyzes system metrics and logs."""
             
-            state["investigation_agent_messages"] = add_messages(state["investigation_agent_messages"], [HumanMessage(f'Current round count: {state["iteration_count_investigator"]}')])
             resp = await self.investigator_agent.llm_with_tools.ainvoke(state["investigation_agent_messages"])
-            state["investigation_agent_messages"] = add_messages(state["investigation_agent_messages"], [resp])
+            # state["investigation_agent_messages"] = add_messages(state["investigation_agent_messages"], [resp])
             
             
-            if state['iteration_count_investigator'] > 2:
-                # return Send(
-                #     node='tools',
-                #     arg={
-                #         'from': 'rate_limit',
-                #         'count': state['iteration_count_investigator'],
-                #         "agent": "investigation_agent"
-                #     }
-                # )
-                return Command(
-                    update={
-                        "orchestrator_agent_messages": [
-                            HumanMessage(content="Agent exceeded maximum iterations - forcing report generation")
-                        ],
-                        "investigation_agent_messages": [
-                            SystemMessage(content="You must generate a final report now using OrchestratorStructuredResponseTool")
-                        ]
-                    },
-                    goto="investigation_agent"
+            if state['iteration_count_investigator'] > 1 and hasattr(resp, 'tool_calls') and tool_calls[0]['name'] != 'OrchestratorStructuredResponseTool':
+                return Send(
+                    node='tools',
+                    arg={
+                        'from': 'rate_limit',
+                        'count': state['iteration_count_investigator'],
+                        "agent": "investigation_agent"
+                    }
                 )
+                # return Command(
+                #     update={
+                #         "orchestrator_agent_messages": [
+                #             HumanMessage(content="Agent exceeded maximum iterations - forcing report generation")
+                #         ],
+                #         "investigation_agent_messages": [
+                #             SystemMessage(content="You must generate a final report now using OrchestratorStructuredResponseTool")
+                #         ]
+                #     },
+                #     goto="investigation_agent"
+                # )
             
             
             # Check if the agent used the OrchestratorStructuredResponseTool
@@ -153,20 +149,25 @@ class AgentGraph():
                         
                     return Command(
                         update={
-                            "orchestrator_agent_messages": [HumanMessage(content=report)],
+                            "orchestrator_agent_messages": [ToolMessage(content=report, name='investigation_agent', tool_call_id=state['investigation_agent_call_id'])],
                             "investigation_agent_messages": [resp],
                             "iteration_count_investigator": state['iteration_count_investigator'] + 1
                         },
                         goto='orchestrator_agent'
                     )
                 else:
-                    return Send('tools', arg={
+                    return Command(
+                        update={
+                            "investigation_agent_messages": [resp]
+                        },
+                        goto=Send('tools', arg={
                             "calls_made": state['iteration_count_investigator'],
                             "from": "investigation_agent", 
                             "tool_calls": tool_calls, 
                             
                             }
                         )
+                    )
         
             
             # If no structured response tool was called, continue investigation
@@ -180,33 +181,28 @@ class AgentGraph():
     
     async def get_code_change_agent_node(self):
         async def code_change_agent_node(state: GraphState) -> Command[Literal['tools', 'orchestrator_agent', 'investigation_agent', END]]:
-            state["code_change_agent_messages"] = add_messages(state["code_change_agent_messages"], [HumanMessage(f'Current round count: {state["iteration_count_code_change"]}')])
             resp = await self.code_change_agnet.llm_with_tools.ainvoke(state["code_change_agent_messages"])
-            state["code_change_agent_messages"] = add_messages(state["code_change_agent_messages"], [resp])
-            print("============================")
-            print()
-            print("============================")
             
-            if state['iteration_count_code_change'] > 2:
-                # return Send(
-                #     node='tools',
-                #     arg={
-                #         'from': 'rate_limit',
-                #         'count': state['iteration_count_code_change'],
-                #         "agent": "code_change_agent"
-                #     }
-                # )
-                return Command(
-                        update={
-                            "orchestrator_agent_messages": [
-                                HumanMessage(content="Agent exceeded maximum iterations - forcing report generation")
-                            ],
-                            "code_change_agent_messages": [
-                                SystemMessage(content="You must generate a final report now using OrchestratorStructuredResponseTool")
-                            ]
-                        },
-                        goto="code_change_agent"
-                    )
+            if state['iteration_count_code_change'] > 1 and hasattr(resp, 'tool_calls') and tool_calls[0]['name'] != 'OrchestratorStructuredResponseTool':
+                return Send(
+                    node='tools',
+                    arg={
+                        'from': 'rate_limit',
+                        'count': state['iteration_count_code_change'],
+                        "agent": "code_change_agent"
+                    }
+                )
+                # return Command(
+                #         update={
+                #             "orchestrator_agent_messages": [
+                #                 HumanMessage(content="Agent exceeded maximum iterations - forcing report generation")
+                #             ],
+                #             "code_change_agent_messages": [
+                #                 SystemMessage(content="You must generate a final report now using OrchestratorStructuredResponseTool")
+                #             ]
+                #         },
+                #         goto="code_change_agent"
+                #     )
                         
             # Check if the agent used the OrchestratorStructuredResponseTool
             if hasattr(resp, 'tool_calls') and getattr(resp, 'tool_calls', None):
@@ -218,19 +214,24 @@ class AgentGraph():
                     
                     return Command(
                         update={
-                            "orchestrator_agent_messages": [HumanMessage(content=report)],
+                            "orchestrator_agent_messages": [ToolMessage(content=report, name='code_change_agent', tool_call_id=state['code_change_agent_call_id'])],
                             "code_change_agent_messages": [resp],
                             "iteration_count_code_change": state['iteration_count_code_change'] + 1
                         },
                         goto='orchestrator_agent'
                     )
                 else:
-                    return Send('tools', arg={
+                    return Command(
+                        update={
+                            "code_change_agent_messages": [resp]
+                        },
+                        goto=Send('tools', arg={
                             "calls_made": state["iteration_count_code_change"],
                             "from": "code_change_agent", 
                             "tool_calls": tool_calls
                             }
                         )
+                    )
         
             
             # If no structured response tool was called, continue code change investigation
@@ -244,11 +245,6 @@ class AgentGraph():
     async def get_tools_node(self):
         async def tools(state: Dict) -> Command[Literal['orchestrator_agent', 'investigation_agent', 'code_change_agent']]:
             try:
-                print("===================================")
-                # print("Print tools call and state")
-                # print(state)
-                print(state['from'], '\n', state['calls_made'])
-                print("===================================")
                 
                 if state['from'] == 'rate_limit':
                     print(f"Rate limit excdeed, number of iterations: {state['count']}")
@@ -260,22 +256,27 @@ class AgentGraph():
                     )
                 
                 if state['from'] == 'orchestrator_agent':
-                    ticket_id = await self.orchestrator_agent.tools.ainvoke(state['tool_calls'])
-                    # print(f"Ticket id:", ticket_id)
+                    import json
+                    resp = json.loads((await self.orchestrator_agent.tools.ainvoke(state['tool_calls']))['messages'][0].content)
+                    print(resp)
+                    
+                    ticket_id, report = resp
+                    
                     return Command(
                         update={
-                            "jira_ticket_id": ticket_id
+                            "jira_ticket_id": ticket_id,
+                            "report": report
                         },
                         goto=END
                     )
                 
                 elif state['from'] == 'investigation_agent':
-                    investigation_agent_messages = (await self.investigator_agent.tools.ainvoke(state['tool_calls']))['messages']
-                    print("===================================")
-                    print("Print investigation agent messages")
-                    print(investigation_agent_messages)
-                    print(state['calls_made'])
-                    print("===================================")
+                    investigation_agent_messages = (await self.investigator_agent.tools.ainvoke(state['tool_calls']))['messages'] + [HumanMessage(f'Number of tool calls made: {state['calls_made']+1}')]
+                    # print("===================================")
+                    # print("Print investigation agent messages")
+                    # print(investigation_agent_messages)
+                    # print(state['calls_made'])
+                    # print("===================================")
                     return Command(
                         update={
                             "investigation_agent_messages": investigation_agent_messages,
@@ -285,7 +286,7 @@ class AgentGraph():
                     )
                 
                 elif state['from'] == 'code_change_agent':
-                    code_change_agent_messages = (await self.code_change_agnet.tools.ainvoke(state['tool_calls']))['messages']
+                    code_change_agent_messages = (await self.code_change_agnet.tools.ainvoke(state['tool_calls']))['messages'] + [HumanMessage(f'Number of tool calls made: {state['calls_made']+1}')]
                     # print("===================================")
                     # print("Print code change agent messages")
                     # print(code_change_agent_messages)
