@@ -1,0 +1,29 @@
+[project]
+name = "nightwatch"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "boto3>=1.39.11",
+    "crewai>=0.148.0",
+    "fastapi>=0.116.1",
+    "google-generativeai>=0.8.5",
+    "langchain>=0.3.26",
+    "langchain-google-genai>=2.0.10",
+    "langchain-openai>=0.3.28",
+    "langgraph>=0.5.4",
+    "openai>=1.97.1",
+    "pydantic>=2.11.7",
+    "python-dotenv>=1.1.1",
+]
+
+[dependency-groups]
+dev = [
+    "arize-phoenix>=11.18.0",
+    "ipykernel>=6.30.0",
+    "langsmith>=0.4.8",
+    "openinference-instrumentation-langchain>=0.1.50",
+    "opentelemetry-exporter-otlp>=1.35.0",
+    "opentelemetry-sdk>=1.35.0",
+]

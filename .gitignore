@@ -1,0 +1,11 @@
+documents/
+
+# files
+*.ipynb
+.env
+.python-version
+settings.json
+
+notebooks/
+uv.lock
+*.pyc
